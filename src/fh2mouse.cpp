@@ -240,6 +240,9 @@ const Action kActions[] = {
     {"AnnaDown", "ANNA: down", "K", -1, 0, 0, false},
     {"AnnaBack", "ANNA: back", "J", -1, 0, 0, false},
     {"AnnaChoose", "ANNA: choose", "L", -1, 0, 0, false},
+    // While ANNA's autodrive is on: holds the button ANNA turns its cinematic camera on and off with
+    // (its ini's, LB unless it says another), see "FH2 ANNA".
+    {"AnnaCinematic", "ANNA: cinematic camera (autodrive)", "LShift", -1, 0, 0, false},
     // ANNA Drone Mode's keys: only while the drone flies, when they're all that counts (with the
     // radio's keys), see "Drone Mode".
     {"DroneForward", "Drone: forward", "W", -1, 0, 0, false},
@@ -286,6 +289,9 @@ struct FH2AnnaApi {
     uint32_t size;
     int (*is_open)(void);
     int (*uses_key)(uint32_t vk);   // always 0 now
+    void* add_entry;                // version 2 (not ours)
+    void* hold_input;               // version 5 (not ours)
+    uint16_t (*cinematic_button)(void);   // version 6: the button to hold for the cinematic key, while it drives
 };
 const FH2AnnaApi* g_anna = nullptr;
 bool is_anna_action(const char* name) { return !std::strncmp(name, "Anna", 4); }
@@ -689,6 +695,8 @@ void add_keyboard_rows() {
         s.label        = labels[i].c_str();
         s.description  = lang::tr(is_drone_action(a.name)
                              ? "ANNA Drone Mode's key while flying the drone. While it flies only its keys (and the radio's) count, so it can be a driving or menu key too."
+                         : !std::strcmp(a.name, "AnnaCinematic")
+                             ? "FH2 ANNA's key while its autodrive drives: turns the cinematic camera on and off, holding the controller button ANNA's ini gives it (LB). It does nothing otherwise, so it can be a driving key too."
                          : is_anna_action(a.name)
                              ? "FH2 ANNA's key while driving, pressing the controller's d-pad for it. The open key is ANNA's whenever you drive, the others only while ANNA's menu is open: a driving key on the same key waits till then."
                          : a.menu  ? "The key for this in the menus. It does nothing while driving, so it can be a driving key too."
@@ -1417,6 +1425,17 @@ bool anna_open() {
     return anna && anna->is_open();
 }
 
+int action_index(const char* name);
+
+// The pad button the cinematic key holds now: ANNA's (version 6) while it drives, else none.
+uint16_t anna_cinematic_bit() {
+    const FH2AnnaApi* anna = g_anna;
+    if (!anna || anna->size < offsetof(FH2AnnaApi, cinematic_button) + sizeof(void*) || !anna->cinematic_button) return 0;
+    static int index = -2;
+    if (index == -2) index = action_index("AnnaCinematic");
+    return index >= 0 && g_held[index].load() ? anna->cinematic_button() : 0;
+}
+
 // The key is ANNA's now (for the driving keys).
 bool anna_key(int vk) {
     if (!g_anna || !vk) return false;
@@ -1464,7 +1483,7 @@ uint64_t anna_pad_bits() {
         if (now[3]) bits |= kPadLeft;
         if (now[4]) bits |= kPadRight;
     }
-    return bits;
+    return bits | anna_cinematic_bit();
 }
 
 // The pad's buttons the keys (and a help bar click) hold.
@@ -2475,18 +2494,24 @@ bool swap_shared_icons() {
     return true;
 }
 
-// FH2 ANNA's two buttons on the HUD (D-pad down that opens it, D-pad right that chooses) are
-// BitmapImages of its own, resources of its control (HUDAnnaControl) named FH2ANNA_Icon_Open and
-// FH2ANNA_Icon_Choose: found from the control (searched for from the top of the window the active
+// FH2 ANNA's buttons on the HUD (D-pad down that opens it, D-pad right that chooses, and the
+// autodrive prompt's cinematic camera button) are BitmapImages of its own, resources of its control
+// (HUDAnnaControl) named FH2ANNA_Icon_Open, FH2ANNA_Icon_Choose and FH2ANNA_Icon_Cinematic: found from the control (searched for from the top of the window the active
 // one is in) and pointed at the ANNA keys' pictures as the shared ones are. A new HUD is a new
 // control: one only we hold is gone, and searched for again.
 struct AnnaIcon {
     const char* name;
-    int action;                   // its key's (kAnnaActions)
+    const char* action;           // its key's (kActions)
     uint8_t* image   = nullptr;   // a reference of ours
     uint8_t* pad_uri = nullptr;   // ditto
 };
-AnnaIcon g_anna_icons[] = {{"FH2ANNA_Icon_Open", 0}, {"FH2ANNA_Icon_Choose", 4}};
+// The cinematic camera's prompt has a picture for each pad button it can be set to (FH2ANNA_Icon_Cinematic
+// is LB's, the others _<button>): the key in each, whichever is set. One an older FH2 ANNA hasn't is skipped.
+AnnaIcon g_anna_icons[] = {{"FH2ANNA_Icon_Open", "AnnaOpen"}, {"FH2ANNA_Icon_Choose", "AnnaChoose"}, {"FH2ANNA_Icon_Cinematic", "AnnaCinematic"},
+                           {"FH2ANNA_Icon_Cinematic_RB", "AnnaCinematic"}, {"FH2ANNA_Icon_Cinematic_A", "AnnaCinematic"},
+                           {"FH2ANNA_Icon_Cinematic_B", "AnnaCinematic"}, {"FH2ANNA_Icon_Cinematic_X", "AnnaCinematic"},
+                           {"FH2ANNA_Icon_Cinematic_Y", "AnnaCinematic"}, {"FH2ANNA_Icon_Cinematic_View", "AnnaCinematic"},
+                           {"FH2ANNA_Icon_Cinematic_L3", "AnnaCinematic"}, {"FH2ANNA_Icon_Cinematic_R3", "AnnaCinematic"}};
 uint8_t* g_anna_control = nullptr;   // a reference of ours (UI thread only)
 
 uint8_t* find_by_type(uint8_t* v, const char* rtti, int depth, int& visited) {
@@ -2551,7 +2576,7 @@ void anna_icons_frame(bool stale) {
     for (const AnnaIcon& s : g_anna_icons) {
         if (!s.image) continue;
         uint8_t* uri  = s.pad_uri;
-        const int i   = anna_action(s.action);
+        const int i   = action_index(s.action);
         const int vk  = i >= 0 ? g_action_keys[i][0] : 0;
         std::string file = vk ? key_file(vk) : std::string();
         if (keys_shown() && !file.empty() && std::find(g_key_files.begin(), g_key_files.end(), file) != g_key_files.end()) {
