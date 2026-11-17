@@ -1784,6 +1784,71 @@ void feed(uint8_t* in, uint64_t bits) {
     history(in + INPUT_STATE, static_cast<uint16_t>(bits & 0xFFFF), f);
 }
 
+// The story's prompts while it holds the car (Horizon Heats' "Enter Event" after the prologue): the story stops the
+// car with States::DisablePlayerCarControlsWrapper, which pushes contexts 6 and 7 alone onto every input's context
+// stack (0x8823C0, with a tag of its own), so the driving controls are off and the HUD counts as a menu here (Enter
+// is A). Then States::WaitForButtonPressUnsafe (0x957170) waits for the prompt: it asks which pad button the game binds
+// to the HUD's prompts (0x106E8F0: context 0, control 21, X with an automatic gearbox, View with a manual one) and looks
+// for that button held in the input's state, not through WasPressed. A controller presses it; the keys never did, and
+// the game waited for good. So while the story holds the car, the Interact key holds that button too.
+constexpr uintptr_t RVA_CAR_LOCK_TAG_LOAD = 0x8823E7;   // mov r8d, [rip+tag]; mov edx, 0xC0 (contexts 6 and 7)
+constexpr uintptr_t RVA_BOUND_BUTTON      = 0x106E8F0;  // int (input, context, control, a): the bound pad button
+constexpr uintptr_t INPUT_CONTEXTS        = 0x38;       // the input's context stack, a deque of {tag, contexts}
+constexpr uintptr_t INPUT_CONTEXTS_FRONT  = 0x50;       // ... the index of its top
+constexpr uintptr_t INPUT_CONTEXTS_COUNT  = 0x58;
+constexpr int kInteractControl = 21, kBoundNone = 0x25;
+using BoundButtonFn = int (*)(void* input, int context, int control, uint8_t a);
+std::atomic<bool> g_interact_down{false};   // the Interact key is down (the UI frame's look at the keys)
+
+// The tag the story's car lock pushes with, or null if the game's code isn't as expected.
+const uint32_t* car_lock_tag() {
+    static const uint32_t* tag = [] () -> const uint32_t* {
+        static const uint8_t load[] = {0x44, 0x8B, 0x05};                        // mov r8d, [rip+disp32]
+        static const uint8_t mask[] = {0xBA, 0xC0, 0x00, 0x00, 0x00};            // mov edx, 0xC0
+        static const uint8_t bound[] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57};
+        const uint8_t* p = g_base + RVA_CAR_LOCK_TAG_LOAD;
+        if (std::memcmp(p, load, sizeof load) || std::memcmp(p + 7, mask, sizeof mask) ||
+            std::memcmp(g_base + RVA_BOUND_BUTTON, bound, sizeof bound)) {
+            logf("the story's car lock isn't as expected: its prompts stay on a controller's button");
+            return nullptr;
+        }
+        return reinterpret_cast<const uint32_t*>(p + 7 + at<int32_t>(p, 3));
+    }();
+    return tag;
+}
+
+// The story holds the car: the top of the input's context stack is the car lock's (contexts 6 and 7 alone).
+bool car_locked(uint8_t* in) {
+    const uint32_t* tag = car_lock_tag();
+    if (!in || !tag || !*tag || !at<uint64_t>(in, INPUT_CONTEXTS_COUNT)) return false;
+    uint8_t* stack = at<uint8_t*>(in, INPUT_CONTEXTS);
+    uint8_t* map   = stack ? at<uint8_t*>(stack, 0) : nullptr;   // as the game reads it (0x1072890)
+    if (!map) return false;
+    const uint64_t size = at<uint64_t>(map, 0x10), front = at<uint64_t>(in, INPUT_CONTEXTS_FRONT);
+    uint8_t** blocks    = at<uint8_t**>(map, 8);
+    if (!blocks || !size || (size & (size - 1))) return false;   // a power of two, as the game's deque has
+    const uint8_t* block = blocks[(front >> 1) & (size - 1)];
+    if (!block) return false;
+    const uint8_t* top = block + (front & 1) * 8;   // {tag, contexts}
+    return at<uint32_t>(top, 0) == *tag && at<uint32_t>(top, 4) == 0xC0;
+}
+
+// The pad button the game binds to the HUD's prompts, as a bit of the input's buttons (0 if none).
+uint64_t prompt_button_bit(uint8_t* in) {
+    const int b = game<BoundButtonFn>(RVA_BOUND_BUTTON)(in, kDriving, kInteractControl, 0);
+    return b >= 0 && b < 64 && b != kBoundNone ? 1ull << b : 0;
+}
+
+// While the story holds the car, the prompts' button (0 otherwise, or if the game's memory isn't as expected).
+uint64_t story_prompt_bit_guarded(uint8_t* in, bool* failed) {
+    __try {
+        return car_locked(in) ? prompt_button_bit(in) : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *failed = true;
+        return 0;
+    }
+}
+
 uintptr_t input_update(void* inputs, float dt) {
     const uintptr_t r = o_input_update(inputs, dt);
     ++g_input_frame;
@@ -1796,12 +1861,23 @@ uintptr_t input_update(void* inputs, float dt) {
         last = buttons;
     }
     if (!g_keyboard) return r;
-    const uint64_t bits = keys_pad_bits();
-    g_fed_bits          = bits;
+    uint64_t bits = keys_pad_bits();
     // Into the input that last asked and the current player's (both handed over by the game each frame). Not a
     // kept pointer to the UI's input: the game swaps it (a restart, a replay), and the old one may be gone.
     uint8_t* all = at<uint8_t*>(g_base, RVA_INPUTS);
     uint8_t* cur = all ? at<uint8_t*>(all, INPUTS_CURRENT) : nullptr;
+    static bool prompt_off = false;   // the game's memory wasn't as expected once: left alone from then on
+    if (g_interact_down.load() && !prompt_off) {   // a story prompt with the car held: its button (see car_locked)
+        bool failed           = false;
+        const uint64_t prompt = story_prompt_bit_guarded(cur ? cur : in, &failed);
+        static bool told      = false;
+        if (failed) prompt_off = true, logf("the story's car lock couldn't be read: its prompts stay on a controller's button");
+        else if (!told && prompt)
+            logf("a story prompt with the car held: Interact presses its pad button (%llx)", static_cast<unsigned long long>(prompt)),
+                told = true;
+        bits |= prompt;
+    }
+    g_fed_bits = bits;
     feed(in, bits);
     if (cur && cur != in) feed(cur, bits);
     // Extra Options reads the buttons as read (see plugin_buttons) in the simulation too, after this.
@@ -4773,6 +4849,7 @@ void keyboard_frame() {
         // the drive gives it back, and the pause menu opens and closes over and over.
         const bool pressed = now && !down[i];
         down[i]            = now;
+        if (a.control == kInteractControl && !a.menu) g_interact_down = now;   // for the story's prompts (car_locked)
         const bool here    = a.menu == menu;
         static bool armed[kActionCount] = {};
         static DWORD until[kActionCount] = {};   // held at least till then (min_ms)
